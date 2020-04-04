@@ -1,0 +1,18 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: pushgateway-svc
+  namespace: monitor
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "6050"
+    prometheus.io/bcc_action: "drop"
+spec:
+  clusterIP: None
+  sessionAffinity: ClientIP
+  selector:
+    app: pushgateway
+  ports:
+  - protocol: TCP
+    port: 6050
+    targetPort: 6050

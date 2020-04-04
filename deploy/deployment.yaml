@@ -1,0 +1,40 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: pushgateway
+  namespace: monitor
+spec:
+  replicas: 5
+  template:
+    metadata:
+      labels:
+        app: pushgateway
+    spec:
+      terminationGracePeriodSeconds: 0
+      hostNetwork: true
+      containers:
+      - name: pushgateway
+        image: repo.jd.local/monitor/pushgateway:v0.6.0.3
+        command: ["/bin/pushgateway"]
+        args:
+        - --web.listen-address=:6050
+        - --web.telemetry-path=/metrics
+        - --web.route-prefix=
+        - --persistence.file=
+        - --persistence.interval=5m
+        - --persistence.queue-capacity=1000000
+        - --log.level=info
+        - --log.format=logger:stderr
+        resources:
+          limits:
+            cpu: "4"
+            memory: 8Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 6050
+          initialDelaySeconds: 10
+          periodSeconds: 10

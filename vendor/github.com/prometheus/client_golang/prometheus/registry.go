@@ -843,6 +843,10 @@ func checkMetricConsistency(
 		h = hashAdd(h, lp.GetValue())
 		h = hashAddByte(h, separatorByte)
 	}
+	if dtoMetric.TimestampMs != nil {
+		h = hashAdd(h, fmt.Sprintf("%d", *dtoMetric.TimestampMs))
+		h = hashAddByte(h, separatorByte)
+	}
 	if _, exists := metricHashes[h]; exists {
 		return fmt.Errorf(
 			"collected metric %q { %s} was collected before with the same name and label values",

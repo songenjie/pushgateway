@@ -30,20 +30,17 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-const (
-	writeQueueCapacity = 1000
-)
-
 // DiskMetricStore is an implementation of MetricStore that persists metrics to
 // disk.
 type DiskMetricStore struct {
-	lock            sync.RWMutex // Protects metricFamilies.
-	writeQueue      chan WriteRequest
-	drain           chan struct{}
-	done            chan error
-	metricGroups    GroupingKeyToMetricGroup
-	persistenceFile string
-	predefinedHelp  map[string]string
+	lock                 sync.RWMutex // Protects metricFamilies.
+	writeQueue           chan WriteRequest
+	drain                chan struct{}
+	done                 chan error
+	metricGroups         GroupingKeyToMetricGroup
+	persistenceFile      string
+	predefinedHelp       map[string]string
+	persistenceMetricTTL time.Duration
 }
 
 type mfStat struct {
@@ -68,15 +65,18 @@ func NewDiskMetricStore(
 	persistenceFile string,
 	persistenceInterval time.Duration,
 	gaptherPredefinedHelpFrom prometheus.Gatherer,
+	writeQueueCapacity int64,
+	persistenceMetricTTL time.Duration,
 ) *DiskMetricStore {
 	// TODO: Do that outside of the constructor to allow the HTTP server to
 	//  serve /-/healthy and /-/ready earlier.
 	dms := &DiskMetricStore{
-		writeQueue:      make(chan WriteRequest, writeQueueCapacity),
-		drain:           make(chan struct{}),
-		done:            make(chan error),
-		metricGroups:    GroupingKeyToMetricGroup{},
-		persistenceFile: persistenceFile,
+		writeQueue:           make(chan WriteRequest, writeQueueCapacity),
+		drain:                make(chan struct{}),
+		done:                 make(chan error),
+		metricGroups:         GroupingKeyToMetricGroup{},
+		persistenceFile:      persistenceFile,
+		persistenceMetricTTL: persistenceMetricTTL,
 	}
 	if err := dms.restore(); err != nil {
 		log.Errorln("Could not load persisted metrics:", err)
@@ -88,6 +88,7 @@ func NewDiskMetricStore(
 	}
 
 	go dms.loop(persistenceInterval)
+	go dms.gcMetricGroups()
 	return dms
 }
 
@@ -96,56 +97,18 @@ func (dms *DiskMetricStore) SubmitWriteRequest(req WriteRequest) {
 	dms.writeQueue <- req
 }
 
+//GetAndDeleteMetricFamilies get metric families then clear metric store
+func (dms *DiskMetricStore) GetAndDeleteMetricFamilies() []*dto.MetricFamily {
+	dms.lock.Lock()
+	defer dms.lock.Unlock()
+	return dms.changeToMetricFamily(dms.metricGroups)
+}
+
 // GetMetricFamilies implements the MetricStore interface.
 func (dms *DiskMetricStore) GetMetricFamilies() []*dto.MetricFamily {
-	result := []*dto.MetricFamily{}
-	mfStatByName := map[string]mfStat{}
-
 	dms.lock.RLock()
 	defer dms.lock.RUnlock()
-
-	for _, group := range dms.metricGroups {
-		for name, tmf := range group.Metrics {
-			mf := tmf.GetMetricFamily()
-			stat, exists := mfStatByName[name]
-			if exists {
-				existingMF := result[stat.pos]
-				if !stat.copied {
-					mfStatByName[name] = mfStat{
-						pos:    stat.pos,
-						copied: true,
-					}
-					existingMF = copyMetricFamily(existingMF)
-					result[stat.pos] = existingMF
-				}
-				if mf.GetHelp() != existingMF.GetHelp() {
-					log.Infof(
-						"Metric families '%s' and '%s' have inconsistent help strings. The latter will have priority. This is bad. Fix your pushed metrics!",
-						mf, existingMF,
-					)
-				}
-				// Type inconsistency cannot be fixed here. We will detect it during
-				// gathering anyway, so no reason to log anything here.
-				for _, metric := range mf.Metric {
-					existingMF.Metric = append(existingMF.Metric, metric)
-				}
-			} else {
-				copied := false
-				if help, ok := dms.predefinedHelp[name]; ok && mf.GetHelp() != help {
-					log.Infof("Metric family '%s' has the same name as a metric family used by the Pushgateway itself but it has a different help string. Changing it to the standard help string %q. This is bad. Fix your pushed metrics!", mf, help)
-					mf = copyMetricFamily(mf)
-					copied = true
-					mf.Help = proto.String(help)
-				}
-				mfStatByName[name] = mfStat{
-					pos:    len(result),
-					copied: copied,
-				}
-				result = append(result, mf)
-			}
-		}
-	}
-	return result
+	return dms.changeToMetricFamily(dms.metricGroups)
 }
 
 // Shutdown implements the MetricStore interface.
@@ -233,9 +196,11 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 	dms.lock.Lock()
 	defer dms.lock.Unlock()
-
+	//put clear request
+	if wr.Labels == nil {
+		return
+	}
 	key := model.LabelsToSignature(wr.Labels)
-
 	if wr.MetricFamilies == nil {
 		// Delete.
 		delete(dms.metricGroups, key)
@@ -251,9 +216,13 @@ func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 			}
 			dms.metricGroups[key] = group
 		}
-		group.Metrics[name] = TimestampedMetricFamily{
+
+		exist := group.Metrics[name]
+
+		group.Metrics[name] = &TimestampedMetricFamily{
 			Timestamp:            wr.Timestamp,
 			GobbableMetricFamily: (*GobbableMetricFamily)(mf),
+			next:                 exist,
 		}
 	}
 }
@@ -347,4 +316,93 @@ func extractPredefinedHelpStrings(g prometheus.Gatherer) (map[string]string, err
 		result[mf.GetName()] = mf.GetHelp()
 	}
 	return result, nil
+}
+
+//changeToMetricFamily before call this method, must be lock(R/W both ok) metrics store
+func (dms *DiskMetricStore) changeToMetricFamily(metricGroups GroupingKeyToMetricGroup) []*dto.MetricFamily {
+	result := []*dto.MetricFamily{}
+	mfStatByName := map[string]mfStat{}
+	for _, group := range metricGroups {
+		for name, tmf := range group.Metrics {
+			for ; tmf != nil; tmf = tmf.next {
+				mf := tmf.GetMetricFamily()
+				stat, exists := mfStatByName[name]
+				if exists {
+					existingMF := result[stat.pos]
+					if !stat.copied {
+						mfStatByName[name] = mfStat{
+							pos:    stat.pos,
+							copied: true,
+						}
+						existingMF = copyMetricFamily(existingMF)
+						result[stat.pos] = existingMF
+					}
+					if mf.GetHelp() != existingMF.GetHelp() {
+					}
+					// Type inconsistency cannot be fixed here. We will detect it during
+					// gathering anyway, so no reason to log anything here.
+					for _, metric := range mf.Metric {
+						existingMF.Metric = append(existingMF.Metric, metric)
+					}
+				} else {
+					copied := false
+					if help, ok := dms.predefinedHelp[name]; ok && mf.GetHelp() != help {
+						log.Infof("Metric family '%s' has the same name as a metric family used by the Pushgateway itself but it has a different help string. Changing it to the standard help string %q. This is bad. Fix your pushed metrics!", mf, help)
+						mf = copyMetricFamily(mf)
+						copied = true
+						mf.Help = proto.String(help)
+					}
+					mfStatByName[name] = mfStat{
+						pos:    len(result),
+						copied: copied,
+					}
+					result = append(result, mf)
+				}
+			}
+		}
+	}
+	return result
+}
+
+// gcMetricGroups garbage collect all expired metrics in metric groups, it just handle
+// first head expired metrics of linked list in processWriteRequest.
+func (dms *DiskMetricStore) gcMetricGroups() {
+	ticker := time.NewTicker(dms.persistenceMetricTTL / 2)
+	gcFunc := func() {
+		dms.lock.Lock()
+		defer dms.lock.Unlock()
+		log.Debugln("Starting metrics group gc")
+		for key, group := range dms.metricGroups {
+			if len(group.Metrics) <= 0 {
+				log.Debugf("Delete empty metrics group %v", key)
+				delete(dms.metricGroups, key)
+				continue
+			}
+			now := time.Now()
+			for name, metric := range group.Metrics {
+				if now.Sub(metric.Timestamp) > dms.persistenceMetricTTL {
+					log.Debugf("Delete expired metric %s in metrics group %v", name, key)
+					delete(group.Metrics, name)
+					continue
+				}
+				for tmp := metric; tmp != nil; tmp = tmp.next {
+					if metric.Timestamp.Sub(tmp.Timestamp) > dms.persistenceMetricTTL {
+						log.Debugf("Delete old metric %s in metrics group %v", name, key)
+						tmp = nil
+						break
+					}
+				}
+			}
+		}
+	}
+	for {
+		select {
+		case <-ticker.C:
+			gcFunc()
+		case <-dms.drain:
+			log.Debugln("Stopping metrics group gc")
+			ticker.Stop()
+			return
+		}
+	}
 }

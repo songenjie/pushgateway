@@ -47,11 +47,13 @@ func main() {
 	var (
 		app = kingpin.New(filepath.Base(os.Args[0]), "The Pushgateway")
 
-		listenAddress       = app.Flag("web.listen-address", "Address to listen on for the web interface, API, and telemetry.").Default(":9091").String()
-		metricsPath         = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		routePrefix         = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints.").Default("").String()
-		persistenceFile     = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
-		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
+		listenAddress        = app.Flag("web.listen-address", "Address to listen on for the web interface, API, and telemetry.").Default(":9091").String()
+		metricsPath          = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		routePrefix          = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints.").Default("").String()
+		persistenceFile      = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
+		persistenceInterval  = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
+		writeQueueCapacity   = app.Flag("persistence.queue-capacity", "The queue capacity to write memory.").Default("1000000").Int64()
+		persistenceMetricTTL = app.Flag("persistence.metric-ttl", "Minimum age for pushed metrics before they are garbage collected.").Default("1m").Duration()
 	)
 	log.AddFlags(app)
 	app.Version(version.Print("pushgateway"))
@@ -74,12 +76,12 @@ func main() {
 		flags[f.Name] = f.Value.String()
 	}
 
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer)
+	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, *writeQueueCapacity, *persistenceMetricTTL)
 
 	// Inject the metric families returned by ms.GetMetricFamilies into the default Gatherer:
 	prometheus.DefaultGatherer = prometheus.Gatherers{
 		prometheus.DefaultGatherer,
-		prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return ms.GetMetricFamilies(), nil }),
+		prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return ms.GetAndDeleteMetricFamilies(), nil }),
 	}
 
 	r := httprouter.New()

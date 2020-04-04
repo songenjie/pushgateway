@@ -109,13 +109,14 @@ func (mg MetricGroup) SortedLabels() []string {
 
 // NameToTimestampedMetricFamilyMap is the second level of the metric store,
 // keyed by metric name.
-type NameToTimestampedMetricFamilyMap map[string]TimestampedMetricFamily
+type NameToTimestampedMetricFamilyMap map[string]*TimestampedMetricFamily
 
 // TimestampedMetricFamily adds the push timestamp to a gobbable version of the
 // MetricFamily-DTO.
 type TimestampedMetricFamily struct {
 	Timestamp            time.Time
 	GobbableMetricFamily *GobbableMetricFamily
+	next                 *TimestampedMetricFamily
 }
 
 // GetMetricFamily returns the normal GetMetricFamily DTO (without the gob additions).

@@ -35,13 +35,91 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"encoding/json"
 	"github.com/prometheus/pushgateway/storage"
+	"io/ioutil"
+	logto "log"
+	"math/rand"
+	"strconv"
 )
 
 const (
 	pushMetricName = "push_time_seconds"
 	pushMetricHelp = "Last Unix time when this group was changed in the Pushgateway."
 )
+
+//json MetircsFamily
+type MericsFamily struct {
+	Publiclabels map[string]string `json:"publiclabels"`
+	Sequence     []*Family         `json:"sequence"`
+}
+
+// Family mirrors the MetricFamily proto message.
+type Family struct {
+	//Time    time.Time
+	Name      string    `json:"name"`
+	Help      string    `json:"help"`
+	Type      string    `json:"type"`
+	Timestamp string    `json:"timestamp"`
+	Metrics   []*Metric `json:"metrics"` // Either metric or summary.
+}
+
+// Metric is for all "single value" metrics, i.e. Counter, Gauge, and Untyped.
+type Metric struct {
+	Labels map[string]string `json:"labels"`
+	Value  string            `json:"value"`
+}
+
+//Parser josn to prometheus metrics
+func ParserJsontoMetricsFamily(body []byte) (*strings.Reader, error) {
+	var metricsfamilys []MericsFamily
+	err := json.Unmarshal(body, &metricsfamilys)
+	if err != nil {
+		return nil, err
+	}
+
+	//json to Metrics Text
+	var MetricsFamilyOfString string
+	for _, metricsfamily := range metricsfamilys {
+		for _, mf := range metricsfamily.Sequence {
+			if mf.Name == "" || mf.Type == "" {
+				logto.Println("Incomplete parameters")
+				continue
+			}
+			if mf.Help != "" {
+				MetricsFamilyOfString += "# HELP " + mf.Name + " " + mf.Help + "\n"
+			}
+			MetricsFamilyOfString += "# TYPE " + mf.Name + " " + mf.Type + "\n"
+			for _, mt := range mf.Metrics {
+				//Value must can convert to float64
+				if _, err = strconv.ParseFloat(mt.Value, 64); err != nil {
+					continue
+				}
+				var MetricsOfString string
+				for k, v := range metricsfamily.Publiclabels {
+					if k == "timestamp" {
+						mf.Timestamp = v
+						continue
+					}
+					MetricsOfString += k + "=\"" + v + "\","
+				}
+				for k, v := range mt.Labels {
+					MetricsOfString += k + "=\"" + v + "\","
+				}
+				if mf.Timestamp == "" {
+					MetricsFamilyOfString += mf.Name + "{" + MetricsOfString + "} " + mt.Value + "\n"
+				} else {
+					MetricsFamilyOfString += mf.Name + "{" + MetricsOfString + "} " + mt.Value + " " + mf.Timestamp + "\n"
+				}
+
+			}
+
+		}
+
+	}
+	return strings.NewReader(MetricsFamilyOfString), nil
+
+}
 
 // Push returns an http.Handler which accepts samples over HTTP and stores them
 // in the MetricStore. If replace is true, all metrics for the job and instance
@@ -70,17 +148,23 @@ func Push(
 			log.Debug("job name is required")
 			return
 		}
-		labels["job"] = job
+		labels["job"] = job + strconv.Itoa(rand.Intn(10000))
+
+		if _, ok := labels["instance"]; !ok {
+			ip := FromRequest(r)
+			labels["instance"] = ip
+		}
 
 		if replace {
 			ms.SubmitWriteRequest(storage.WriteRequest{
-				Labels:    labels,
+				Labels:    nil,
 				Timestamp: time.Now(),
 			})
 		}
 
 		var metricFamilies map[string]*dto.MetricFamily
 		ctMediatype, ctParams, ctErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+
 		if ctErr == nil && ctMediatype == "application/vnd.google.protobuf" &&
 			ctParams["encoding"] == "delimited" &&
 			ctParams["proto"] == "io.prometheus.client.MetricFamily" {
@@ -95,6 +179,13 @@ func Push(
 				}
 				metricFamilies[mf.GetName()] = mf
 			}
+		} else if r.Header.Get("Content-Type") == "application/json" {
+			if body, err := ioutil.ReadAll(r.Body); err == nil {
+				if Reader, err := ParserJsontoMetricsFamily(body); err == nil {
+					var parser expfmt.TextParser
+					metricFamilies, err = parser.TextToMetricFamilies(Reader)
+				}
+			}
 		} else {
 			// We could do further content-type checks here, but the
 			// fallback for now will anyway be the text format
@@ -107,12 +198,8 @@ func Push(
 			log.Debugf("Failed to parse text, %v", err.Error())
 			return
 		}
-		if timestampsPresent(metricFamilies) {
-			http.Error(w, "pushed metrics must not have timestamps", http.StatusBadRequest)
-			log.Debug("pushed metrics must not have timestamps")
-			return
-		}
 		now := time.Now()
+		removeDuplicateLabel(metricFamilies)
 		addPushTimestamp(metricFamilies, now)
 		sanitizeLabels(metricFamilies, labels)
 		ms.SubmitWriteRequest(storage.WriteRequest{
@@ -171,7 +258,7 @@ func LegacyPush(
 		labels := map[string]string{"job": job, "instance": instance}
 		if replace {
 			ms.SubmitWriteRequest(storage.WriteRequest{
-				Labels:    labels,
+				Labels:    nil,
 				Timestamp: time.Now(),
 			})
 		}
@@ -210,6 +297,7 @@ func LegacyPush(
 			return
 		}
 		now := time.Now()
+		removeDuplicateLabel(metricFamilies)
 		addPushTimestamp(metricFamilies, now)
 		sanitizeLabels(metricFamilies, labels)
 		ms.SubmitWriteRequest(storage.WriteRequest{
@@ -324,17 +412,34 @@ func timestampsPresent(metricFamilies map[string]*dto.MetricFamily) bool {
 
 // Add metric to indicate the push time.
 func addPushTimestamp(metricFamilies map[string]*dto.MetricFamily, t time.Time) {
-	metricFamilies[pushMetricName] = &dto.MetricFamily{
-		Name: proto.String(pushMetricName),
-		Help: proto.String(pushMetricHelp),
-		Type: dto.MetricType_GAUGE.Enum(),
-		Metric: []*dto.Metric{
-			{
-				Gauge: &dto.Gauge{
-					Value: proto.Float64(float64(t.UnixNano()) / 1e9),
-				},
-			},
-		},
+	nowMS := t.UnixNano() / 1e6
+	for _, mf := range metricFamilies {
+		for _, m := range mf.GetMetric() {
+			if m.TimestampMs == nil || *m.TimestampMs < t.Add(-1*time.Hour).UnixNano()/1e6 || *m.TimestampMs > t.Add(1*time.Hour).UnixNano()/1e6 {
+				m.TimestampMs = &nowMS
+			}
+		}
+	}
+}
+
+// removeDuplicateLabel remove duplicated label, and keep the first one
+// eg: java_info{version="1.0", version="2.0"} 1 --> java_info{version="1.0"} 1
+func removeDuplicateLabel(metricFamilies map[string]*dto.MetricFamily) {
+	for _, family := range metricFamilies {
+		for _, metric := range family.Metric {
+			m := make(map[string]string)
+			labels := make([]*dto.LabelPair, 0, len(metric.Label))
+			for _, label := range metric.Label {
+				if _, ok := m[*label.Name]; !ok {
+					m[*label.Name] = *label.Value
+					labels = append(labels, &dto.LabelPair{
+						Name:  label.Name,
+						Value: label.Value,
+					})
+				}
+			}
+			metric.Label = labels
+		}
 	}
 }
 
