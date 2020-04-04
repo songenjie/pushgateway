@@ -1,3 +1,6 @@
+# Please go to my repo
+https://github.com/songenjie/pushgateway/commits/v0.6.0-ttl
+
 # Prometheus Pushgateway
 
 [![Build Status](https://travis-ci.org/prometheus/pushgateway.svg)][travis]
